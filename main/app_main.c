@@ -138,7 +138,7 @@ static esp_err_t wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &inst_got_ip));
 
-    /* Set STA mode */
+    /* Set STA mode (HT20 — HT40 tested but worse due to 2.4GHz congestion) */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     esp_wifi_set_ps(WIFI_PS_NONE);
 

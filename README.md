@@ -6,10 +6,23 @@ Tested on **Waveshare ESP32-P4-WIFI6-NANO**.
 
 ## Results
 
+### Throughput Progression
+
+| Config | SDIO Clock | Bandwidth | Sender (Mbps) | Receiver (Mbps) | Notes |
+|--------|-----------|-----------|---------------|-----------------|-------|
+| Baseline | 25 MHz | HT20 | 33.46 | 29-33 | ~9.6% packet loss |
+| Faster SDIO | 40 MHz | HT20 | 40.14 | ~36 | SDIO was the bottleneck |
+| Wider channel | 40 MHz | HT40 | 42.56 | 13-25 (degrading) | 2.4 GHz congestion, worse |
+
+**Best config: 40 MHz SDIO + HT20** — ~36 Mbps real-world throughput.
+
+HT40 increased sender throughput slightly but caused severe packet loss due to 2.4 GHz interference. The wider 40 MHz channel overlaps with neighboring networks.
+
+### Legacy Tests
+
 | Test | Throughput | Notes |
 |------|-----------|-------|
 | UDP broadcast (AP mode, loopback) | 33.61 Mbps | Zero errors, 3001 pps |
-| UDP stream to host (STA mode) | 29-33 Mbps | ~9.6% packet loss over 30s |
 
 ### API Capability Probe
 
