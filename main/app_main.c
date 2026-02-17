@@ -20,6 +20,8 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "wifi_raw.h"
+#include "esp_partition.h"
+#include "esp_hosted_ota.h"
 
 static const char *TAG = "wifi_stream";
 
@@ -32,7 +34,8 @@ static const char *TAG = "wifi_stream";
 /* ─── Streaming Configuration ─── */
 #define TARGET_IP             "192.168.1.128"
 #define TARGET_PORT           5001
-#define TX_PACKET_SIZE        1400
+#define TX_PACKET_SIZE        1400   /* UDP (must fit in MTU) */
+#define TCP_TX_CHUNK_SIZE     16384  /* TCP (stack handles segmentation) */
 #define TEST_DURATION_SEC     30
 #define STATS_INTERVAL_MS     1000
 
@@ -283,6 +286,141 @@ static void test_udp_stream(void)
     ESP_LOGI(TAG, "╚═══════════════════════════════════════════════╝");
 }
 
+/* ─── TCP Streaming Task ─── */
+static volatile uint32_t s_tcp_tx_packets = 0;
+static volatile uint64_t s_tcp_tx_bytes = 0;
+static volatile uint32_t s_tcp_tx_errors = 0;
+static volatile bool s_tcp_tx_running = false;
+
+static void tcp_stream_task(void *arg)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "TCP socket() failed: %d", errno);
+        s_tcp_tx_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Disable Nagle — keeps pipeline full with continuous sends */
+    int flag = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    /* Large send buffer */
+    int sndbuf = 131072;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(TARGET_PORT + 1),  /* TCP on port+1 */
+    };
+    inet_aton(TARGET_IP, &dest.sin_addr);
+
+    /* Retry connection up to 10 times with 3s delay */
+    int connected = 0;
+    for (int attempt = 1; attempt <= 10; attempt++) {
+        ESP_LOGI(TAG, "TCP connecting to %s:%d (attempt %d/10)...", TARGET_IP, TARGET_PORT + 1, attempt);
+        if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) == 0) {
+            connected = 1;
+            break;
+        }
+        ESP_LOGW(TAG, "TCP connect failed (errno %d), retrying in 3s...", errno);
+        close(sock);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock < 0) break;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
+    if (!connected) {
+        ESP_LOGE(TAG, "TCP connect failed after 10 attempts. Start receiver: iperf3 -s -p 5002");
+        if (sock >= 0) close(sock);
+        s_tcp_tx_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "TCP connected!");
+
+    uint8_t *buf = malloc(TCP_TX_CHUNK_SIZE);
+    if (!buf) {
+        close(sock);
+        s_tcp_tx_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    for (int i = 0; i < TCP_TX_CHUNK_SIZE; i++)
+        buf[i] = (uint8_t)(i & 0xFF);
+
+    while (s_tcp_tx_running) {
+        int sent = send(sock, buf, TCP_TX_CHUNK_SIZE, 0);
+        if (sent > 0) {
+            s_tcp_tx_packets++;
+            s_tcp_tx_bytes += sent;
+        } else {
+            s_tcp_tx_errors++;
+            if (errno == ENOMEM || errno == EAGAIN) {
+                taskYIELD();
+            } else {
+                ESP_LOGE(TAG, "TCP send error: %d", errno);
+                break;
+            }
+        }
+    }
+
+    free(buf);
+    close(sock);
+    ESP_LOGI(TAG, "TCP stream task stopped");
+    vTaskDelete(NULL);
+}
+
+static void test_tcp_stream(void)
+{
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "════════════════════════════════════════");
+    ESP_LOGI(TAG, "  TCP Stream to %s:%d (%ds)", TARGET_IP, TARGET_PORT + 1, TEST_DURATION_SEC);
+    ESP_LOGI(TAG, "════════════════════════════════════════");
+
+    s_tcp_tx_packets = 0;
+    s_tcp_tx_bytes = 0;
+    s_tcp_tx_errors = 0;
+    s_tcp_tx_running = true;
+
+    xTaskCreatePinnedToCore(tcp_stream_task, "tcp_tx", 4096, NULL,
+                            configMAX_PRIORITIES - 2, NULL, 0);
+
+    /* Wait a moment for connection */
+    vTaskDelay(pdMS_TO_TICKS(500));
+    if (!s_tcp_tx_running) {
+        ESP_LOGE(TAG, "TCP connection failed, skipping test");
+        return;
+    }
+
+    for (int sec = 1; sec <= TEST_DURATION_SEC; sec++) {
+        vTaskDelay(pdMS_TO_TICKS(STATS_INTERVAL_MS));
+        if (!s_tcp_tx_running) break;
+        uint64_t bytes = s_tcp_tx_bytes;
+        uint32_t pkts = s_tcp_tx_packets;
+        uint32_t errs = s_tcp_tx_errors;
+        float mbps = (sec > 0) ? (bytes * 8.0f / 1000000.0f / sec) : 0;
+        float pps = (sec > 0) ? ((float)pkts / sec) : 0;
+        ESP_LOGI(TAG, "  [%2ds] %6lu pkts (%4.0f pps) | %6.2f Mbps | err:%lu",
+                 sec, (unsigned long)pkts, pps, mbps, (unsigned long)errs);
+    }
+
+    s_tcp_tx_running = false;
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    float mbps = s_tcp_tx_bytes * 8.0f / 1000000.0f / TEST_DURATION_SEC;
+
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔═══════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  TCP RESULT: %.2f Mbps (%lu pkts, %lu err)  ║",
+             mbps, (unsigned long)s_tcp_tx_packets, (unsigned long)s_tcp_tx_errors);
+    ESP_LOGI(TAG, "║  Target: %s:%d via '%s'  ║",
+             TARGET_IP, TARGET_PORT + 1, s_connected_ssid);
+    ESP_LOGI(TAG, "╚═══════════════════════════════════════════════╝");
+}
+
 /* ─── Packet Monitor Test ─── */
 static volatile uint32_t s_mon_mgmt = 0;
 static volatile uint32_t s_mon_ctrl = 0;
@@ -382,6 +520,112 @@ static void test_packet_monitor(void)
     ESP_LOGI(TAG, "╚═══════════════════════════════════════════════╝");
 }
 
+/* ─── Slave OTA Update ─── */
+static void try_slave_ota(void)
+{
+    ESP_LOGI(TAG, "════════════════════════════════════════");
+    ESP_LOGI(TAG, "  Checking slave_fw partition for OTA...");
+    ESP_LOGI(TAG, "════════════════════════════════════════");
+
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, 0x40, "slave_fw");
+    if (!part) {
+        ESP_LOGI(TAG, "  No slave_fw partition found, skipping OTA");
+        return;
+    }
+
+    /* Check if partition has valid data (first 4 bytes = ESP image magic 0xE9) */
+    uint8_t magic;
+    esp_partition_read(part, 0, &magic, 1);
+    if (magic != 0xE9) {
+        ESP_LOGI(TAG, "  slave_fw partition empty (magic=0x%02x), skipping OTA", magic);
+        return;
+    }
+
+    /* Read image size from header (bytes 16-19 in esp_image_header_t contain segment count,
+     * but we'll just send the whole partition — the slave validates internally) */
+    ESP_LOGI(TAG, "  Found slave firmware in partition (%lu bytes), starting OTA...",
+             (unsigned long)part->size);
+
+    esp_err_t ret = esp_hosted_slave_ota_begin();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "  OTA begin failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    /* Send firmware in 1400-byte chunks */
+    const size_t chunk_size = 1400;
+    uint8_t *buf = malloc(chunk_size);
+    if (!buf) {
+        ESP_LOGE(TAG, "  OTA malloc failed");
+        esp_hosted_slave_ota_end();
+        return;
+    }
+
+    /* Find actual firmware size from image header */
+    uint8_t header[24];
+    esp_partition_read(part, 0, header, sizeof(header));
+    /* ESP image: total size is not in header, scan until we find 0xFF padding.
+     * Simpler: just send until we hit all-0xFF blocks or reach partition end. */
+    size_t total_sent = 0;
+    bool done = false;
+    for (size_t offset = 0; offset < part->size && !done; offset += chunk_size) {
+        size_t to_read = (offset + chunk_size <= part->size) ? chunk_size : (part->size - offset);
+        esp_partition_read(part, offset, buf, to_read);
+
+        /* Check if this block is all 0xFF (erased flash = end of firmware) */
+        bool all_ff = true;
+        for (size_t i = 0; i < to_read; i++) {
+            if (buf[i] != 0xFF) { all_ff = false; break; }
+        }
+        if (all_ff && offset > 0x1000) {
+            done = true;
+            break;
+        }
+
+        ret = esp_hosted_slave_ota_write(buf, to_read);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "  OTA write failed at offset %u: %s",
+                     (unsigned)offset, esp_err_to_name(ret));
+            free(buf);
+            esp_hosted_slave_ota_end();
+            return;
+        }
+        total_sent += to_read;
+
+        if ((offset % (100 * chunk_size)) == 0) {
+            ESP_LOGI(TAG, "  OTA progress: %lu bytes sent...", (unsigned long)total_sent);
+        }
+    }
+    free(buf);
+
+    ESP_LOGI(TAG, "  OTA write complete: %lu bytes sent", (unsigned long)total_sent);
+
+    ret = esp_hosted_slave_ota_end();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "  OTA end failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "  Activating new slave firmware...");
+    ret = esp_hosted_slave_ota_activate();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "  OTA activate failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "  ╔═══════════════════════════════════════╗");
+    ESP_LOGI(TAG, "  ║  Slave OTA COMPLETE — rebooting...    ║");
+    ESP_LOGI(TAG, "  ╚═══════════════════════════════════════╝");
+
+    /* Erase the partition so we don't OTA again on next boot */
+    esp_partition_erase_range(part, 0, part->size);
+
+    /* Give slave time to reboot, then restart host */
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    esp_restart();
+}
+
 /* ─── Main ─── */
 void app_main(void)
 {
@@ -392,31 +636,53 @@ void app_main(void)
     ESP_LOGI(TAG, "╚═══════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
 
-    /* Phase 1: Connect to WiFi */
+    /* Phase 1: Connect to WiFi (also brings up SDIO transport to C6) */
     esp_err_t ret = wifi_init_sta();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WiFi connection failed. Halting.");
         while (1) vTaskDelay(pdMS_TO_TICKS(10000));
     }
 
+    /* Phase 0: Check for slave firmware OTA update.
+     * Must happen AFTER wifi_init_sta() — the SDIO transport to the C6
+     * is initialized asynchronously by esp_wifi_init() and only becomes
+     * ready ~18s later. A successful WiFi connection proves the RPC
+     * channel is up. If OTA succeeds, device restarts automatically. */
+    try_slave_ota();
+
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    /* Phase 2: UDP stream throughput test */
+    /* Heap diagnostics */
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "════════════════════════════════════════");
+    ESP_LOGI(TAG, "  Heap Status (post-WiFi connect)");
+    ESP_LOGI(TAG, "════════════════════════════════════════");
+    ESP_LOGI(TAG, "  Free heap:     %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "  Free internal: %lu bytes", (unsigned long)esp_get_free_internal_heap_size());
+    ESP_LOGI(TAG, "  Min free heap: %lu bytes", (unsigned long)esp_get_minimum_free_heap_size());
+
+    /* Phase 2: UDP TX throughput test */
     test_udp_stream();
 
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    /* Phase 3: TCP TX throughput test */
+    test_tcp_stream();
+
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    /* Phase 3: Packet monitor test */
+    /* Phase 4: Packet monitor test */
     test_packet_monitor();
 
     /* Done */
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "════════════════════════════════════════");
-    ESP_LOGI(TAG, "  STREAMING TEST COMPLETE");
+    ESP_LOGI(TAG, "  ALL TESTS COMPLETE");
     ESP_LOGI(TAG, "════════════════════════════════════════");
+    ESP_LOGI(TAG, "  Final free heap:     %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "  Min free heap:       %lu bytes", (unsigned long)esp_get_minimum_free_heap_size());
 
     while (1) {
-        ESP_LOGI(TAG, "Free heap: %lu", (unsigned long)esp_get_free_heap_size());
         vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }

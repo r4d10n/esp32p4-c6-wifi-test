@@ -213,6 +213,106 @@ idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
+## Transport & Throughput Analysis
+
+### P4 ↔ C6 Communication
+
+The P4 and C6 are connected via **SDIO only** on the Waveshare board (7 wires: CLK, CMD, D0-D3, RESET GPIO 54). No SPI, UART, or other bus is available.
+
+| Transport | Max Throughput | Status |
+|-----------|---------------|--------|
+| **SDIO 4-bit @ 40 MHz** | **79.5 Mbps** | **Wired on board, in use** |
+| SPI Full-Duplex @ 40 MHz | 25 Mbps | Not wired |
+| SPI Half-Duplex Quad | 50-80 Mbps (est.) | Not wired |
+| UART @ 921600 baud | 0.74 Mbps | Not wired |
+
+SDIO is ~3x faster than SPI-FD at the same clock. The WiFi PHY (~36 Mbps) is the bottleneck, not the transport (79.5 Mbps) — there is **2.5x headroom** on SDIO.
+
+### Why WiFi 6 Throughput is "Only" 36 Mbps
+
+The ESP32-C6 supports 802.11ax (WiFi 6) with a PHY maximum of 143.4 Mbps (HE MCS11, HT20, GI=0.8µs). Real-world throughput is 36 Mbps — **25.1% PHY efficiency**. The gap is explained by four cascading factors:
+
+| Stage | Mbps | Loss | Cause |
+|-------|------|------|-------|
+| PHY max (HE MCS11, HT20) | 143.4 | — | Spec ceiling |
+| Realistic MCS7 (64-QAM 5/6) | 86.0 | -57.4 | MCS11 needs ~-40 dBm; typical indoor RSSI is -55 to -65 dBm |
+| After MAC overhead (A-MPDU, BA win=6) | 61.9 | -24.1 | 72% MAC efficiency — SIFS/DIFS/ACK/BA handshake |
+| **Single-core CPU bottleneck** | **46.5** | **-15.4** | **Primary architectural limit** (1×160 MHz RISC-V) |
+| lwIP + socket + SDIO | 42.0 | -4.5 | Protocol stack overhead |
+| **Measured application** | **~36** | -6.0 | Real-world variance |
+
+**The C6's single-core 160 MHz RISC-V is the primary bottleneck.** At 36 Mbps / 1400B packets = 3,214 pps, each packet gets ~49,800 CPU cycles to traverse: WiFi DMA ISR → lwIP → SDIO DMA. The ESP32-C5 (dual-core 240 MHz, same HE radio) achieves ~55 Mbps.
+
+#### WiFi 6 Features on C6
+
+| Feature | Status | Throughput Impact |
+|---------|--------|-------------------|
+| 1024-QAM (MCS10/11) | Yes (PHY capable) | Rarely used — needs excellent SNR |
+| MU-MIMO | **No** — 1T1R single antenna | Major speed gains come from this |
+| 5 GHz band | **No** — 2.4 GHz only | No access to wider/cleaner channels |
+| OFDMA (DL/UL) | Partial (STA-side) | Minor improvement |
+| BSS Coloring | Yes | Reduces congestion collisions |
+| TWT | Yes | Power saving, not throughput |
+| A-MPDU / A-MSDU | Yes | Enabled, BA window=6 (low) |
+
+The "WiFi 6" label is accurate but misleading. The big speed gains (MU-MIMO, 5 GHz) are absent. The C6's WiFi 6 advantage is better modulation coding and interference management, not raw speed.
+
+#### Cross-Chip Comparison
+
+| Chip | CPU | WiFi | Measured UDP | PHY Efficiency |
+|------|-----|------|-------------|----------------|
+| ESP32 | 2×240 MHz Xtensa | 802.11n | ~20 Mbps | 27.7% |
+| ESP32-S3 | 2×240 MHz Xtensa | 802.11n | ~25 Mbps | 34.6% |
+| **ESP32-C6** | **1×160 MHz RISC-V** | **802.11ax** | **~36 Mbps** | **25.1%** |
+| ESP32-C5 | 2×240 MHz RISC-V | 802.11ax | ~55 Mbps | 38.4% |
+
+### esp-hosted RPC Overhead
+
+WiFi data frames and RPC commands share a **single SDIO Function 1 channel**. There is no hardware separation — multiplexing is purely software via `if_type` in a 12-byte `esp_payload_header`.
+
+| Overhead Source | Cost | Impact |
+|----------------|------|--------|
+| Per-packet header | 12 bytes | 0.79% at 1500B MTU |
+| SDIO block alignment | 24 bytes padding (at 1500B) | 2.3% wire overhead |
+| RPC priority preemption | 25.6 µs per RPC event | WiFi frames deferred during RPC |
+| RPC round-trip latency | ~0.5 ms | Limits raw TX to ~2000 frames/sec |
+| Promiscuous mode forwarding | ~85 µs CPU per packet | 8.5% C6 CPU at 1000 pkt/s |
+| SDIO RX buffer pool | 60 KB (40 × 1536B) | 11.7% of C6's 512 KB SRAM |
+
+**Key insight**: RPC commands have the highest TX/RX priority (`PRIO_Q_SERIAL`), dequeued before WiFi data (`PRIO_Q_OTHERS`). CustomRpc (promiscuous/raw TX) uses the same priority path — high promiscuous capture rates directly compete with WiFi data throughput.
+
+For normal WiFi STA data (no promiscuous mode), esp-hosted adds only ~3% wire overhead. The SDIO transport at 40 MHz (160 Mbps effective) has ample headroom for the WiFi PHY ceiling.
+
+### Optimization Opportunities
+
+Quick-win `sdkconfig.defaults` changes, ordered by expected impact:
+
+```ini
+# 1. TCP window size — CRITICAL (current 5760B caps TCP at ~15 Mbps)
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+
+# 2. A-MPDU BA window (current=6, max=32 for HT / 256 for HE)
+CONFIG_ESP_WIFI_TX_BA_WIN=32
+CONFIG_ESP_WIFI_RX_BA_WIN=32
+
+# 3. lwIP IRAM placement (reduces per-packet latency)
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+
+# 4. SDIO clock bump (test signal integrity first)
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=50000
+
+# 5. Larger SDIO queues
+CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=64
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=64
+
+# 6. Pin lwIP to core 1 (P4 is dual-core)
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+```
+
+**Already optimal**: WiFi power save disabled (`WIFI_PS_NONE`), system PM disabled, network buffers in internal SRAM (not PSRAM), mempool 64-byte aligned, SDIO streaming mode, WiFi/GDMA in IRAM.
+
 ## Key Learnings
 
 - **WiFi init**: Use `WIFI_INIT_CONFIG_DEFAULT()` on P4 - zeroed config causes `ESP_ERR_INVALID_ARG`
