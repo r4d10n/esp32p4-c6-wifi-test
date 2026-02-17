@@ -19,6 +19,7 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "wifi_raw.h"
 
 static const char *TAG = "wifi_stream";
 
@@ -282,6 +283,105 @@ static void test_udp_stream(void)
     ESP_LOGI(TAG, "╚═══════════════════════════════════════════════╝");
 }
 
+/* ─── Packet Monitor Test ─── */
+static volatile uint32_t s_mon_mgmt = 0;
+static volatile uint32_t s_mon_ctrl = 0;
+static volatile uint32_t s_mon_data = 0;
+static volatile uint32_t s_mon_misc = 0;
+
+static void monitor_rx_cb(const wifi_raw_rx_pkt_t *pkt)
+{
+    /* Count by type */
+    switch (pkt->type) {
+        case 0: s_mon_mgmt++; break;  /* WIFI_PKT_MGMT */
+        case 1: s_mon_ctrl++; break;  /* WIFI_PKT_CTRL */
+        case 2: s_mon_data++; break;  /* WIFI_PKT_DATA */
+        default: s_mon_misc++; break; /* WIFI_PKT_MISC */
+    }
+
+    /* Log first bytes of management frames for beacon/probe detection */
+    if (pkt->type == 0 && pkt->payload_len >= 24) {
+        uint8_t subtype = (pkt->payload[0] >> 4) & 0x0F;
+        const char *name = "other";
+        switch (subtype) {
+            case 0: name = "assoc_req"; break;
+            case 1: name = "assoc_resp"; break;
+            case 4: name = "probe_req"; break;
+            case 5: name = "probe_resp"; break;
+            case 8: name = "beacon"; break;
+            case 10: name = "disassoc"; break;
+            case 11: name = "auth"; break;
+            case 12: name = "deauth"; break;
+        }
+        /* Only log non-beacon frames or every 100th beacon to avoid flooding */
+        if (subtype != 8 || (s_mon_mgmt % 100) == 1) {
+            ESP_LOGI("monitor", "MGMT %s ch:%d rssi:%d len:%d",
+                     name, pkt->channel, pkt->rssi, pkt->payload_len);
+        }
+    }
+}
+
+static void test_packet_monitor(void)
+{
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "════════════════════════════════════════");
+    ESP_LOGI(TAG, "  Phase 3: Packet Monitor Test (10s)");
+    ESP_LOGI(TAG, "════════════════════════════════════════");
+
+    /* Init wifi_raw */
+    esp_err_t ret = wifi_raw_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_raw_init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    /* Register RX callback */
+    wifi_raw_register_rx_cb(monitor_rx_cb);
+
+    /* Set filter: management + data frames */
+    ret = wifi_raw_set_filter(0x0F);  /* WIFI_PROMIS_FILTER_MASK_ALL */
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Set filter: %s (continuing anyway)", esp_err_to_name(ret));
+    }
+
+    /* Enable promiscuous mode */
+    s_mon_mgmt = 0;
+    s_mon_ctrl = 0;
+    s_mon_data = 0;
+    s_mon_misc = 0;
+
+    ret = wifi_raw_set_promiscuous(true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Enable promiscuous mode failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "Promiscuous mode ENABLED - capturing packets...");
+
+    /* Monitor for 10 seconds with stats every second */
+    for (int sec = 1; sec <= 10; sec++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGI(TAG, "  [%2ds] mgmt:%lu ctrl:%lu data:%lu misc:%lu",
+                 sec,
+                 (unsigned long)s_mon_mgmt, (unsigned long)s_mon_ctrl,
+                 (unsigned long)s_mon_data, (unsigned long)s_mon_misc);
+    }
+
+    /* Disable promiscuous mode */
+    ret = wifi_raw_set_promiscuous(false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Disable promiscuous mode: %s", esp_err_to_name(ret));
+    }
+
+    uint32_t total = s_mon_mgmt + s_mon_ctrl + s_mon_data + s_mon_misc;
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔═══════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  MONITOR RESULT: %lu packets captured        ║", (unsigned long)total);
+    ESP_LOGI(TAG, "║  MGMT:%lu CTRL:%lu DATA:%lu MISC:%lu         ║",
+             (unsigned long)s_mon_mgmt, (unsigned long)s_mon_ctrl,
+             (unsigned long)s_mon_data, (unsigned long)s_mon_misc);
+    ESP_LOGI(TAG, "╚═══════════════════════════════════════════════╝");
+}
+
 /* ─── Main ─── */
 void app_main(void)
 {
@@ -303,6 +403,11 @@ void app_main(void)
 
     /* Phase 2: UDP stream throughput test */
     test_udp_stream();
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    /* Phase 3: Packet monitor test */
+    test_packet_monitor();
 
     /* Done */
     ESP_LOGI(TAG, "");
